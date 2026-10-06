@@ -1,6 +1,6 @@
 import random
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -17,6 +17,7 @@ LIMITE_SEGURO = 102_000
 LIMITE_ATENCAO = 110_000
 LIMITE_CRITICO = 115_000
 GATILHO_MANUTENCAO = 119_000
+TEMPO_STANDBY_MINUTOS = 10  # Regra dos 10 minutos de inatividade
 
 
 # =========================
@@ -35,7 +36,8 @@ def inicializar_banco():
                 nome TEXT PRIMARY KEY,
                 diametro REAL,
                 tonelagem REAL,
-                estado TEXT
+                estado TEXT,
+                ultima_atualizacao TEXT
             )
         """
         )
@@ -54,16 +56,17 @@ def inicializar_banco():
 
         cursor.execute("SELECT COUNT(*) FROM cilindros")
         if cursor.fetchone()[0] == 0:
+            agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cilindros_iniciais = [
-                ("Cilindro 1", 500.0, 103500.0, "EM USO"),
-                ("Cilindro 2", 495.0, 45000.0, "STAND-BY"),
-                ("Cilindro 3", 488.0, 118500.0, "STAND-BY"),
-                ("Cilindro 4", 510.0, 0.0, "ARMAZENADO"),
-                ("Cilindro 5", 505.0, 12000.0, "ARMAZENADO"),
-                ("Cilindro 6", 492.0, 0.0, "ARMAZENADO"),
+                ("Cilindro 1", 500.0, 103500.0, "EM USO", agora),
+                ("Cilindro 2", 495.0, 45000.0, "STAND-BY", agora),
+                ("Cilindro 3", 488.0, 118500.0, "STAND-BY", agora),
+                ("Cilindro 4", 510.0, 0.0, "ARMAZENADO", agora),
+                ("Cilindro 5", 505.0, 12000.0, "ARMAZENADO", agora),
+                ("Cilindro 6", 492.0, 0.0, "ARMAZENADO", agora),
             ]
             cursor.executemany(
-                "INSERT INTO cilindros VALUES (?, ?, ?, ?)", cilindros_iniciais
+                "INSERT INTO cilindros VALUES (?, ?, ?, ?, ?)", cilindros_iniciais
             )
 
 
@@ -89,14 +92,43 @@ def atualizar_cilindro(nome, **kwargs):
 def salvar_historico(cilindro, tonelagem, diametro, status):
     with conectar_bd() as conn:
         cursor = conn.cursor()
-        agora = datetime.now().strftime("%d/%m/%Y %H:%M")
+        agora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor.execute(
             """
             INSERT INTO historico (data_hora, cilindro, tonelagem, diametro, status)
             VALUES (?, ?, ?, ?, ?)
         """,
-            (agora, cilindro, tonelagem, diametro, status),
+            (agora_str, cilindro, tonelagem, diametro, status),
         )
+
+
+def verificar_e_aplicar_standby_automatico():
+    """Verifica se o CLP ficou sem enviar dados por mais de 10 minutos"""
+    cilindros_bd = obter_cilindros()
+    agora = datetime.now()
+
+    for nome, dados in cilindros_bd.items():
+        if dados["estado"] == "EM USO" and dados.get("ultima_atualizacao"):
+            try:
+                ultima_leitura = datetime.strptime(
+                    dados["ultima_atualizacao"], "%Y-%m-%d %H:%M:%S"
+                )
+                tempo_parado = (agora - ultima_leitura).total_seconds() / 60
+
+                if tempo_parado >= TEMPO_STANDBY_MINUTOS:
+                    atualizar_cilindro(
+                        nome,
+                        estado="STAND-BY",
+                        ultima_atualizacao=agora.strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    salvar_historico(
+                        nome,
+                        dados["tonelagem"],
+                        dados["diametro"],
+                        "Stand-by Automático (Inatividade > 10 min)",
+                    )
+            except ValueError:
+                pass
 
 
 def obter_historico():
@@ -119,8 +151,9 @@ def classificar(tonelagem):
 
 
 # =========================
-# CONTROLE LATERAL
+# PROCESSA STANDBY AUTOMÁTICO
 # =========================
+verificar_e_aplicar_standby_automatico()
 cilindros = obter_cilindros()
 
 if "cilindro_ativo" not in st.session_state:
@@ -129,6 +162,10 @@ if "cilindro_ativo" not in st.session_state:
 cilindro_nome = st.session_state.cilindro_ativo
 cilindro_dados = cilindros[cilindro_nome]
 
+
+# =========================
+# CONTROLE LATERAL
+# =========================
 with st.sidebar:
     st.title("⚙️ Painel CLP")
 
@@ -139,8 +176,13 @@ with st.sidebar:
         index=list(cilindros.keys()).index(cilindro_nome),
     )
     if novo_ativo != cilindro_nome:
-        atualizar_cilindro(cilindro_nome, estado="STAND-BY")
-        atualizar_cilindro(novo_ativo, estado="EM USO")
+        agora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        atualizar_cilindro(
+            cilindro_nome, estado="STAND-BY", ultima_atualizacao=agora_str
+        )
+        atualizar_cilindro(
+            novo_ativo, estado="EM USO", ultima_atualizacao=agora_str
+        )
         st.session_state.cilindro_ativo = novo_ativo
         st.rerun()
 
@@ -153,18 +195,30 @@ with st.sidebar:
     )
 
     if st.button("🔄 Resetar Tonelagem"):
+        agora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         atualizar_cilindro(
-            cilindro_nome, diametro=novo_diam, tonelagem=0, estado="EM USO"
+            cilindro_nome,
+            diametro=novo_diam,
+            tonelagem=0,
+            estado="EM USO",
+            ultima_atualizacao=agora_str,
         )
         salvar_historico(cilindro_nome, 0, novo_diam, "Reset / Novo Ciclo")
         st.success("Ciclo resetado!")
         st.rerun()
 
     st.markdown("---")
-    if st.button("➕ Simular Leitura (+1.500t)"):
+    if st.button("➕ Simular Leitura CLP (+1.500t)"):
+        agora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         nova_ton = cilindro_dados["tonelagem"] + random.randint(1000, 2000)
         _, status = classificar(nova_ton)
-        atualizar_cilindro(cilindro_nome, tonelagem=nova_ton)
+
+        atualizar_cilindro(
+            cilindro_nome,
+            tonelagem=nova_ton,
+            estado="EM USO",
+            ultima_atualizacao=agora_str,
+        )
         salvar_historico(
             cilindro_nome, nova_ton, cilindro_dados["diametro"], status
         )
@@ -181,10 +235,15 @@ tonelagem_atual = cilindro_dados["tonelagem"]
 nivel, status = classificar(tonelagem_atual)
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Cilindro em Uso", cilindro_nome)
+col1.metric("Cilindro Selecionado", cilindro_nome)
 col2.metric("Diâmetro Atual", f"{cilindro_dados['diametro']} mm")
 col3.metric("Tonelagem Acumulada", f"{tonelagem_atual:,.0f} t")
-col4.metric("Status no Sistema", f"{nivel} | {status}")
+col4.metric(
+    "Estado Atual",
+    f"{cilindro_dados['estado']} ({nivel})"
+    if cilindro_dados["estado"] == "EM USO"
+    else "🟡 STAND-BY",
+)
 
 # Barra de Progresso
 st.progress(min(tonelagem_atual / META_MAXIMA, 1.0))
@@ -197,7 +256,7 @@ if tonelagem_atual >= GATILHO_MANUTENCAO:
 
 st.markdown("---")
 
-# Visualização Enxuta dos 6 Cilindros
+# Visualização dos 6 Cilindros
 st.subheader("📦 Visão Geral dos 6 Cilindros")
 cols = st.columns(6)
 for idx, (nome, dados) in enumerate(cilindros.items()):
@@ -214,7 +273,7 @@ for idx, (nome, dados) in enumerate(cilindros.items()):
 
 st.markdown("---")
 
-# Gráfico de Linha Enxuto
+# Gráfico de Linha
 st.subheader("📈 Histórico de Desgaste")
 df_hist = obter_historico()
 df_cil = df_hist[df_hist["Cilindro"] == cilindro_nome]
